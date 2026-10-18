@@ -184,9 +184,9 @@ async function importDWGNative(file,input){
   window.nativeDwgEntities=sourceEnts; window.nativeDwgRenderEntities=renderEnts;
   refreshDWGHitIndex(); bindDWGDirectPicking();
   fillDWGEntityPicker(sourceEnts);
-  const tools=document.getElementById('dwgEntityTools'); if(tools)tools.hidden=!ents.length;
+  const tools=document.getElementById('dwgEntityTools'); if(tools)tools.hidden=!sourceEnts.length;
   const shxBtn=document.getElementById('btnSHX'); if(shxBtn){let missing=[];try{missing=nativeDwgViewer.getMissingReferences()||[]}catch(_){} shxBtn.hidden=!missing.length; if(missing.length)shxBtn.textContent='Impor SHX ('+missing.length+')';}
-  status.textContent=`DWG terbuka: ${file.name} | ${ents.length} entitas terdeteksi | mode tampilan CAD`;
+  status.textContent=`DWG terbuka: ${file.name} | ${sourceEnts.length} entitas sumber, ${renderEnts.length} entitas render terdeteksi | mode tampilan CAD`;
   toast('DWG berhasil dibuka. Gunakan roda mouse untuk zoom dan drag untuk geser. Klik garis/polyline langsung untuk memilih objek; jika objek tidak tersorot, gunakan daftar entitas sebagai cadangan.');
  }catch(err){
   console.error('Native DWG import failed:',err); host.hidden=true;svg.style.display='';
