@@ -172,7 +172,7 @@ async function importDWGNative(file,input){
    // This avoids the origin:null failure when testing a local HTML file and supports HTTPS hosting.
    const workerModuleUrl='https://cdn.jsdelivr.net/npm/@flyfish-dev/cad-viewer@0.8.0/dist/wasm/dwg-worker.js';
    const workerBootstrapUrl=URL.createObjectURL(new Blob([`import(${JSON.stringify(workerModuleUrl)}).catch(e=>{postMessage({type:'error',message:'Gagal memuat DWG worker: '+(e&&e.message||e)});});`],{type:'text/javascript'}));
-   nativeDwgViewer=new mod.CadViewer({container:host,renderer:'auto',wasmPath:assetBase,dwfWasmUrl:assetBase+'dwfv-render.wasm',workerUrl:workerBootstrapUrl,canvasOptions:{background:'#101820',foreground:'#eaf4ff',fitMode:'saved-view',contrastMode:'preserve',showUnsupportedMarkers:true,enableSpatialIndex:true,maxCurveSegments:96,textMinPixelHeight:2,maxVisibleTextLabels:8000},onLoadProgress:p=>{if(p&&p.message)status.textContent=`Membaca DWG: ${p.message}${p.percent!=null?' '+p.percent+'%':''}`;},onError:e=>console.error('DWG viewer:',e),onViewChange:e=>{window.__mepCadViewState=e;}});
+   nativeDwgViewer=new mod.CadViewer({container:host,renderer:'auto',wasmPath:assetBase,dwfWasmUrl:assetBase+'dwfv-render.wasm',workerUrl:workerBootstrapUrl,canvasOptions:{background:'#101820',foreground:'#eaf4ff',fitMode:'saved-view',contrastMode:'preserve',showUnsupportedMarkers:true,enableSpatialIndex:true,maxCurveSegments:96,textMinPixelHeight:2,maxVisibleTextLabels:8000},onLoadProgress:p=>{if(p&&p.message)status.textContent=`Membaca DWG: ${p.message}${p.percent!=null?' '+p.percent+'%':''}`;},onError:e=>console.error('DWG viewer:',e),onViewChange:e=>{window.__mepCadViewState=e; if(window.__mepCadPickRefresh) clearTimeout(window.__mepCadPickRefresh); window.__mepCadPickRefresh=setTimeout(()=>{dwgPickBounds=null;refreshDWGHitIndex();},80);}});
   }
   host.hidden=false; svg.style.display='none';
   await nativeDwgViewer.loadFile(file);
@@ -224,23 +224,30 @@ let dwgPickBound=false, dwgPointerDown=null, dwgRenderEntities=[], dwgPickBounds
 function cadEntityType(e){return String(e?.type||e?.entityType||e?.kind||e?.objectType||'').toUpperCase()}
 function cadPoint(p){if(!p)return null; if(Array.isArray(p)&&p.length>=2){const x=Number(p[0]),y=Number(p[1]);return Number.isFinite(x)&&Number.isFinite(y)?[x,y]:null;} if(typeof p==='object'){const x=Number(p.x??p.X??p[0]??p.position?.x),y=Number(p.y??p.Y??p[1]??p.position?.y);return Number.isFinite(x)&&Number.isFinite(y)?[x,y]:null;}return null}
 function cadEntityGeometryPoints(e){
- // Prefer ordered vertices for polylines; don't mix start/end points into vertex order.
- const typ=cadEntityType(e); const g=e?.geometry||e?.geom||e?.shape||{};
- const readList=(v)=>Array.isArray(v)?v.map(cadPoint).filter(Boolean):[];
- for(const obj of [e,g]){
-  for(const k of ['vertices','points','coordinates','controlPoints','fitPoints','vertexes']){
-   const q=readList(obj?.[k]); if(q.length>=2)return q;
-  }
+ // CAD parser versions use different nesting for entity geometry. Read common ordered
+ // vertex arrays first, then recursively inspect geometry wrappers without walking metadata.
+ const g=e?.geometry||e?.geom||e?.shape||e?.data||{};
+ const readList=(v)=>{
+  if(!Array.isArray(v))return [];
+  const direct=v.map(cadPoint); if(direct.length>=2&&direct.every(Boolean))return direct;
+  const nested=[]; for(const item of v){const p=cadPoint(item);if(p)nested.push(p);else if(Array.isArray(item)){const q=cadPoint(item);if(q)nested.push(q)}}
+  return nested;
+ };
+ for(const obj of [e,g]) for(const k of ['vertices','points','coordinates','controlPoints','fitPoints','vertexes','coords','path','polyline']){
+  const q=readList(obj?.[k]); if(q.length>=2)return q;
  }
- const p1=cadPoint(e?.startPoint||e?.start||e?.p1||e?.from||g?.startPoint||g?.start||g?.p1||g?.from);
- const p2=cadPoint(e?.endPoint||e?.end||e?.p2||e?.to||g?.endPoint||g?.end||g?.p2||g?.to);
+ const p1=cadPoint(e?.startPoint||e?.start||e?.p1||e?.from||e?.startVertex||g?.startPoint||g?.start||g?.p1||g?.from||g?.startVertex);
+ const p2=cadPoint(e?.endPoint||e?.end||e?.p2||e?.to||e?.endVertex||g?.endPoint||g?.end||g?.p2||g?.to||g?.endVertex);
  if(p1&&p2)return [p1,p2];
- const at=cadPoint(e?.position||e?.insert||e?.insertionPoint||e?.location||e?.origin||g?.position||g?.insert||g?.insertionPoint);
+ const at=cadPoint(e?.position||e?.insert||e?.insertionPoint||e?.location||e?.origin||e?.basePoint||g?.position||g?.insert||g?.insertionPoint||g?.basePoint);
  if(at)return [at];
  const center=cadPoint(e?.center||g?.center); if(center)return [center];
- // Last-resort scan only immediate common coordinate fields.
- const out=[]; for(const k of ['startPoint','endPoint','start','end','p1','p2','from','to','position','insert','center','location']){const q=cadPoint(e?.[k]);if(q)out.push(q)}
- return out;
+ // Last-resort scan of shallow geometry wrappers used by some CAD parsers.
+ for(const obj of [g,e?.data,e?.geometry?.data]) if(obj&&typeof obj==='object'){
+  for(const k of ['start','end','p1','p2','from','to','a','b','startPoint','endPoint']){const q=cadPoint(obj[k]);if(q&&k!=='start'&&k!=='end'){} }
+  for(const k of ['vertices','points','coordinates','coords','controlPoints']){const q=readList(obj[k]);if(q.length>=2)return q;}
+ }
+ return [];
 }
 function refreshDWGHitIndex(){
  let doc=null;try{doc=nativeDwgViewer?.getDocument?.()}catch(_){}
@@ -251,37 +258,44 @@ function refreshDWGHitIndex(){
  if(maxX-minX<1e-9||maxY-minY<1e-9){dwgPickBounds=null;return}
  dwgPickBounds={minX,minY,maxX,maxY};
 }
-function dwgPointToScreen(p,rect,b){
- // Fallback maps the current render-space extents to the CAD canvas. The viewer's pan/zoom
- // state is recorded so we can refresh bounds after view changes; entity picking is most
- // accurate immediately after Fit until the viewer exposes a public worldToScreen API.
- const pad=4,scale=Math.min((rect.width-pad*2)/(b.maxX-b.minX),(rect.height-pad*2)/(b.maxY-b.minY));
- const usedW=(b.maxX-b.minX)*scale,usedH=(b.maxY-b.minY)*scale;
- return [rect.left+(rect.width-usedW)/2+(p[0]-b.minX)*scale,rect.top+(rect.height-usedH)/2+(b.maxY-p[1])*scale];
+function dwgPointToScreen(p,rect,b,mode='fit'){
+ // Candidate projections cover common CAD renderer viewport policies (fit, stretch and
+ // aspect-fit). This avoids assuming one canvas padding policy for every browser size.
+ const pad=mode==='pad'?18:4,dx=Math.max(1e-12,b.maxX-b.minX),dy=Math.max(1e-12,b.maxY-b.minY);
+ let sx=(rect.width-pad*2)/dx,sy=(rect.height-pad*2)/dy;
+ if(mode==='fit'||mode==='pad'){const sc=Math.min(sx,sy);sx=sc;sy=sc;}
+ const usedW=dx*sx,usedH=dy*sy;
+ const ox=mode==='left'?rect.left+pad:rect.left+(rect.width-usedW)/2;
+ const oy=mode==='top'?rect.top+pad:rect.top+(rect.height-usedH)/2;
+ return [ox+(p[0]-b.minX)*sx,oy+(b.maxY-p[1])*sy];
 }
-function dwgEntityScreenPoints(e,rect,b){return cadEntityGeometryPoints(e).map(p=>dwgPointToScreen(p,rect,b))}
+function dwgEntityScreenPoints(e,rect,b,mode='fit'){return cadEntityGeometryPoints(e).map(p=>dwgPointToScreen(p,rect,b,mode))}
 function pointSegmentDistance(px,py,a,b){const dx=b[0]-a[0],dy=b[1]-a[1],den=dx*dx+dy*dy;if(!den)return Math.hypot(px-a[0],py-a[1]);const t=Math.max(0,Math.min(1,((px-a[0])*dx+(py-a[1])*dy)/den));return Math.hypot(px-(a[0]+t*dx),py-(a[1]+t*dy))}
 function findDWGEntityAt(clientX,clientY){
  const host=document.getElementById('dwgViewer');if(!host||host.hidden)return null;
  const canvas=host.querySelector('canvas');const rect=(canvas||host).getBoundingClientRect();
  if(!dwgPickBounds)refreshDWGHitIndex();const b=dwgPickBounds;if(!b)return null;
- let best=null,bestD=14;
- dwgRenderEntities.forEach((e,i)=>{
-  const typ=cadEntityType(e),ps=dwgEntityScreenPoints(e,rect,b);if(!ps.length)return;
-  let d=Infinity;
-  if(/TEXT|MTEXT|ATTRIB|ATTDEF|DIMENSION|MLEADER/.test(typ)){
-   // Text anchors are at the insertion point; use a wider target so the visible label is clickable.
-   d=Math.hypot(clientX-ps[0][0],clientY-ps[0][1]);
-   const raw=String(e?.text??e?.value??e?.string??e?.contents??e?.textString??e?.text?.value??'');
-   const box=Math.min(70,Math.max(18,raw.length*4)); if(d<box) d=Math.min(d,5);
-  } else if(ps.length===1) d=Math.hypot(clientX-ps[0][0],clientY-ps[0][1]);
-  else for(let j=1;j<ps.length;j++)d=Math.min(d,pointSegmentDistance(clientX,clientY,ps[j-1],ps[j]));
-  if((typ.includes('POLYLINE')||typ==='LWPOLYLINE')&&ps.length>2&&(e.closed||e.isClosed||((Number(e.flags)||0)&1)))d=Math.min(d,pointSegmentDistance(clientX,clientY,ps[ps.length-1],ps[0]));
-  if(d<bestD){bestD=d;best={e,i,d}}
- });return best;
+ // Test several renderer-fit mappings. Only accept a hit inside a tight screen-space radius;
+ // this prevents a click on empty space from selecting an unrelated entity.
+ const modes=['fit','stretch','pad','left','top']; let best=null,bestD=15;
+ for(const mode of modes){
+  dwgRenderEntities.forEach((e,i)=>{
+   const typ=cadEntityType(e),ps=dwgEntityScreenPoints(e,rect,b,mode);if(!ps.length)return;
+   let d=Infinity;
+   if(/TEXT|MTEXT|ATTRIB|ATTDEF|DIMENSION|MLEADER/.test(typ)){
+    d=Math.hypot(clientX-ps[0][0],clientY-ps[0][1]);
+    const raw=String(e?.text??e?.value??e?.string??e?.contents??e?.textString??e?.text?.value??'');
+    const box=Math.min(58,Math.max(16,raw.length*3.5)); if(d<box)d=Math.min(d,4.5);
+   } else if(ps.length===1) d=Math.hypot(clientX-ps[0][0],clientY-ps[0][1]);
+   else for(let j=1;j<ps.length;j++)d=Math.min(d,pointSegmentDistance(clientX,clientY,ps[j-1],ps[j]));
+   if((typ.includes('POLYLINE')||typ==='LWPOLYLINE')&&ps.length>2&&(e.closed||e.isClosed||((Number(e.flags)||0)&1)))d=Math.min(d,pointSegmentDistance(clientX,clientY,ps[ps.length-1],ps[0]));
+   if(d<bestD){bestD=d;best={e,i,d,projection:mode}}
+  });
+ }
+ return best;
 }
 function showDWGSelectionHighlight(e){const host=document.getElementById('dwgViewer');if(!host)return;let layer=document.getElementById('dwgSelectionOverlay');if(!layer){layer=document.createElementNS('http://www.w3.org/2000/svg','svg');layer.id='dwgSelectionOverlay';layer.style.cssText='position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:20;overflow:visible';host.style.position='relative';host.appendChild(layer)}layer.innerHTML='';const canvas=host.querySelector('canvas'),r=(canvas||host).getBoundingClientRect(),hr=host.getBoundingClientRect(),ps=dwgEntityScreenPoints(e,r,dwgPickBounds).map(p=>[p[0]-hr.left,p[1]-hr.top]);if(ps.length<1)return;const poly=document.createElementNS('http://www.w3.org/2000/svg',ps.length===1?'circle':'polyline');if(ps.length===1){poly.setAttribute('cx',ps[0][0]);poly.setAttribute('cy',ps[0][1]);poly.setAttribute('r','7')}else{poly.setAttribute('points',ps.map(p=>p.join(',')).join(' '));poly.setAttribute('fill','none');poly.setAttribute('stroke-linejoin','round');poly.setAttribute('stroke-linecap','round');poly.setAttribute('stroke-width','5')}poly.setAttribute('stroke','#ffdf4d');poly.setAttribute('fill',ps.length===1?'#ffdf4d':'none');poly.setAttribute('opacity','.95');layer.appendChild(poly)}
-function bindDWGDirectPicking(){const host=document.getElementById('dwgViewer');if(!host||dwgPickBound)return;dwgPickBound=true;host.addEventListener('pointerdown',e=>{if(e.button!==0)return;dwgPointerDown={x:e.clientX,y:e.clientY,t:Date.now()}} ,true);host.addEventListener('pointerup',e=>{const d=dwgPointerDown;dwgPointerDown=null;if(!d||e.button!==0||Date.now()-d.t>700||Math.hypot(e.clientX-d.x,e.clientY-d.y)>4)return;const hit=findDWGEntityAt(e.clientX,e.clientY);if(!hit){const help=document.getElementById('dwgEntityHelp');if(help)help.textContent=`Klik belum mengenai entitas terpetakan. Entitas render: ${dwgRenderEntities.length}; titik geometri: ${dwgPickBounds?'tersedia':'tidak terdeteksi'}. Tekan Fit gambar lalu coba kembali.`;return;}const sourceList=window.nativeDwgEntities||[];const renderList=window.nativeDwgRenderEntities||dwgRenderEntities;const hitRender=renderList[hit.i]||hit.e;const hnd=String(hitRender.handle||hitRender.id||'');const original=sourceList.find(x=>hnd&&String(x.handle||x.id||'')===hnd)||sourceList[hit.i]||hitRender;showDWGSelectionHighlight(hitRender);const typ=cadEntityType(original);if(/TEXT|MTEXT|ATTRIB|ATTDEF/.test(typ)){const raw=String(original.text??original.value??original.string??original.contents??original.textString??'').replace(/\\P/g,' ').replace(/%%C/gi,'Ø').replace(/%%D/gi,'°').replace(/%%P/gi,'±').replace(/\U\+2300/gi,'Ø');const m=raw.match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})/);if(m){activeCadSize=m[1]+'x'+m[2];document.getElementById('w').value=m[1];document.getElementById('h').value=m[2];document.getElementById('matName').value=`Ducting ${moduleType} ${m[1]} x ${m[2]}`;toast(`Ukuran dipilih: ${activeCadSize} mm`)}else{const dia=raw.match(/(?:Ø|%%C)\s*(\d{2,4})/i);if(dia){activeCadSize='Ø'+dia[1];toast(`Diameter dipilih: Ø${dia[1]} mm. Pilih modul pipa/bulat untuk perhitungan diameter.`)}else toast('Teks CAD dipilih, tetapi format ukurannya belum dikenali: '+raw.slice(0,80))}return;}const srcIndex=(window.nativeDwgEntities||[]).indexOf(original);const select=document.getElementById('dwgEntitySelect');if(select&&srcIndex>=0){const opt=[...select.options].find(o=>Number(o.value)===srcIndex);if(opt)select.value=String(srcIndex)}if(!original||dwgEntityLength(original)<=0){toast('Objek tersorot, tetapi panjangnya belum terbaca untuk takeoff.');return}const len=dwgEntityLength(original)/1000;const size=activeCadSize&&activeCadSize.match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})/);if(size){document.getElementById('w').value=size[1];document.getElementById('h').value=size[2]}const w=+document.getElementById('w').value||0,h=+document.getElementById('h').value||0;if(!w||!h){toast('Pilih teks ukuran ducting terlebih dahulu atau isi W/H.');return}if(takeoffs.some(t=>t.source==='DWG'&&String(t.cadHandle||'')===String(original.handle||original.id||''))){toast('Objek DWG ini sudah masuk takeoff.');return}takeoffSelectedDWGEntityFrom(original,len);},true)}
+function bindDWGDirectPicking(){const host=document.getElementById('dwgViewer');if(!host||dwgPickBound)return;dwgPickBound=true;host.addEventListener('pointerdown',e=>{if(e.button!==0)return;dwgPointerDown={x:e.clientX,y:e.clientY,t:Date.now()}} ,true);host.addEventListener('pointerup',e=>{const d=dwgPointerDown;dwgPointerDown=null;if(!d||e.button!==0||Date.now()-d.t>700||Math.hypot(e.clientX-d.x,e.clientY-d.y)>4)return;const hit=findDWGEntityAt(e.clientX,e.clientY);if(!hit){const help=document.getElementById('dwgEntityHelp');if(help)help.textContent=`Klik belum mengenai garis pada radius deteksi. Entitas render: ${dwgRenderEntities.length}; titik geometri: ${dwgPickBounds?'tersedia':'tidak terdeteksi'}. Tekan Fit gambar, lalu klik tepat pada garis atau teks.`;return;}const sourceList=window.nativeDwgEntities||[];const renderList=window.nativeDwgRenderEntities||dwgRenderEntities;const hitRender=renderList[hit.i]||hit.e;const hnd=String(hitRender.handle||hitRender.id||'');const original=sourceList.find(x=>hnd&&String(x.handle||x.id||'')===hnd)||sourceList[hit.i]||hitRender;showDWGSelectionHighlight(hitRender);const typ=cadEntityType(original);if(/TEXT|MTEXT|ATTRIB|ATTDEF/.test(typ)){const raw=String(original.text??original.value??original.string??original.contents??original.textString??'').replace(/\\P/g,' ').replace(/%%C/gi,'Ø').replace(/%%D/gi,'°').replace(/%%P/gi,'±').replace(/\U\+2300/gi,'Ø');const m=raw.match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})/);if(m){activeCadSize=m[1]+'x'+m[2];document.getElementById('w').value=m[1];document.getElementById('h').value=m[2];document.getElementById('matName').value=`Ducting ${moduleType} ${m[1]} x ${m[2]}`;toast(`Ukuran dipilih: ${activeCadSize} mm`)}else{const dia=raw.match(/(?:Ø|%%C)\s*(\d{2,4})/i);if(dia){activeCadSize='Ø'+dia[1];toast(`Diameter dipilih: Ø${dia[1]} mm. Pilih modul pipa/bulat untuk perhitungan diameter.`)}else toast('Teks CAD dipilih, tetapi format ukurannya belum dikenali: '+raw.slice(0,80))}return;}const srcIndex=(window.nativeDwgEntities||[]).indexOf(original);const select=document.getElementById('dwgEntitySelect');if(select&&srcIndex>=0){const opt=[...select.options].find(o=>Number(o.value)===srcIndex);if(opt)select.value=String(srcIndex)}if(!original||dwgEntityLength(original)<=0){toast('Objek tersorot, tetapi panjangnya belum terbaca untuk takeoff.');return}const len=dwgEntityLength(original)/1000;const size=activeCadSize&&activeCadSize.match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})/);if(size){document.getElementById('w').value=size[1];document.getElementById('h').value=size[2]}const w=+document.getElementById('w').value||0,h=+document.getElementById('h').value||0;if(!w||!h){toast('Pilih teks ukuran ducting terlebih dahulu atau isi W/H.');return}if(takeoffs.some(t=>t.source==='DWG'&&String(t.cadHandle||'')===String(original.handle||original.id||''))){toast('Objek DWG ini sudah masuk takeoff.');return}takeoffSelectedDWGEntityFrom(original,len);},true)}
 function takeoffSelectedDWGEntityFrom(e,len){const w=+document.getElementById('w').value||0,h=+document.getElementById('h').value||0,thick=+document.getElementById('thick').value||0,waste=Math.max(0,+document.getElementById('waste').value||0)/100,area=2*(w+h)*len/1000,weight=moduleType==='BJLS'?area*(materials.find(x=>String(x.thick)===String(thick))?.kgm2||0):0,panelArea=Math.max(1,(+document.getElementById('panelW').value||1200)*(+document.getElementById('panelL').value||4000)/1e6),panel=moduleType==='PU'?Math.ceil(area*(1+waste)/panelArea):0,spacing=Math.max(.1,+document.getElementById('spacing').value||1.5),supports=Math.ceil(len/spacing)+1;takeoffs.push({module:moduleType,name:document.getElementById('matName').value||`Ducting ${moduleType} ${w}x${h}`,w,h,thick,joint:document.getElementById('joint').value,length:len,area,weight,panel,supports,waste:waste*100,source:'DWG',cadHandle:e.handle||e.id||'',layer:e?.layer?.name||e?.layerName||e?.layer||'0'});persist();renderTakeoffs();refreshCalc();toast(`Objek DWG dipilih langsung: ${len.toFixed(3)} m masuk takeoff`)}
 async function importSHXReference(ev){const file=ev.target.files&&ev.target.files[0];if(!file)return;try{if(!nativeDwgViewer||typeof nativeDwgViewer.addReferenceFile!=='function')throw new Error('Muat file DWG terlebih dahulu.');await nativeDwgViewer.addReferenceFile(file);const missing=nativeDwgViewer.getMissingReferences()||[];const btn=document.getElementById('btnSHX');if(btn){btn.hidden=!missing.length;btn.textContent=missing.length?'Impor SHX ('+missing.length+')':'Font SHX dimuat';}toast('File SHX diproses. Periksa kembali teks dan tipe garis gambar.')}catch(err){toast('Gagal memuat SHX: '+(err.message||err))}finally{ev.target.value=''}}
 
